@@ -2267,15 +2267,11 @@ Engine::set_tempo (double tempo, bool rt)
 			nframes_t cycleframes = (nframes_t) _tempo_frames;
 			nframes_t currpos = 0;
 			if (_sync_source > 0) {
-				// the loop reports its cycle length and position in loop time, so
-				// convert them to real time using the loop's playback speed
+				// the tempo is derived from the loop time cycle length, so the
+				// cycle length and position are used in loop time as well
 				Looper * srcloop = rt ? _rt_instances[_sync_source-1] : _instances[_sync_source-1];
-				double speed = srcloop->get_playback_speed();
-				if (speed <= 0.0) {
-					speed = 1.0;
-				}
-				cycleframes = (nframes_t) ((double) (srcloop->get_control_value(Event::CycleLength) * srate) / speed);
-				currpos  = (nframes_t) ((double) (srcloop->get_control_value(Event::LoopPosition) * srate) / speed);
+				cycleframes = (nframes_t) (srcloop->get_control_value(Event::CycleLength) * srate);
+				currpos  = (nframes_t) (srcloop->get_control_value(Event::LoopPosition) * srate);
 			}
 			else {
 				// XXX - only works for internal/midi  (doesn't really work at all)
@@ -2641,15 +2637,23 @@ Engine::generate_sync (nframes_t offset, nframes_t nframes)
 
 		// The loop reports its cycle length, position and length in loop time.
 		// If it is playing at a different speed (rate or time stretch) then
-		// loop time and real time differ by this factor.
+		// loop time advances by this many samples per real time sample.
 		double speed = srcloop->get_playback_speed();
 		if (speed <= 0.0) {
 			speed = 1.0;
 		}
 
 		if (srcloop->get_control_value(Event::State) != LooperStateRecording) {
-			// calc new tempo, from the real time length of a cycle
-			nframes_t cycleframes = (nframes_t) ((double) (srcloop->get_control_value(Event::CycleLength) * _driver->get_samplerate()) / speed);
+			// Calc the new tempo from the cycle length in loop time.  This is
+			// deliberately independent of the playback speed (rate/stretch):
+			//  - the loop's own plugin counts its quantize grid in loop time
+			//    using this tempo, so it has to stay a loop time tempo,
+			//  - deriving it from the real time cycle length would make
+			//    "smart eighths" rewrite the eighths per cycle whenever the
+			//    stretch pushes the tempo outside 60..240, and that change
+			//    is not undone when the stretch is restored, which leaves
+			//    the sync grid different from before.
+			nframes_t cycleframes = (nframes_t) (srcloop->get_control_value(Event::CycleLength) * _driver->get_samplerate());
 			double ntempo = 0.0;
 			if (cycleframes > 0) {
 				ntempo = (_driver->get_samplerate() * 30.0 * _eighth_cycle / cycleframes);
@@ -2678,9 +2682,10 @@ Engine::generate_sync (nframes_t offset, nframes_t nframes)
 				int inst_stt = (int)(srcloop->get_control_value(Event::State));
 				bool inst_paused = (inst_stt == LooperStateOff || inst_stt == LooperStatePaused || inst_stt == LooperStateOffMuted);
 				if ((loopframes > 0) && !inst_paused) {
-					// position and length are in loop time, so bring the quarter
-					// note length and the cycle duration into loop time as well
-					nframes_t qframes = (nframes_t) (_quarter_note_frames * speed);
+					// position and length are in loop time, and so is the quarter
+					// note length (the tempo is a loop time tempo).  Only the span
+					// this block covers has to be brought into loop time.
+					nframes_t qframes = (nframes_t) _quarter_note_frames;
 					nframes_t spanframes = (nframes_t) (nframes * speed);
 
 					if (qframes > 0) {

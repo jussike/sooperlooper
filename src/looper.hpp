@@ -265,6 +265,13 @@ class Looper
 	bool                  _stretch_active;     // stretch path was used by the previous call
 	bool                  _sync_fifo_reset;    // stretchers were reset, restart the delay line
 
+	// Loop time accounting for the stretch path, used to find out how far the
+	// loop position is ahead of the audible (delayed) output.  When the
+	// stretcher is bypassed the loop position is moved back by that amount so
+	// the audible loop stays continuous and in sync with the slaves.
+	double                _stretch_consumed;   // loop time samples fed to the stretcher
+	double                _stretch_emitted;    // loop time equivalent of the output taken from it
+
 	bool _ok;
 	volatile bool request_pending;
 

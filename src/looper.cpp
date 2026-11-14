@@ -138,6 +138,50 @@ static void resample_sync (const float * in, nframes_t inframes, float * out, nf
 }
 
 
+/*
+ * Moves the playback position of a plugin instance back by loopframes (loop
+ * time samples, in playback direction).  Used when the stretcher is bypassed:
+ * while it was in use the audible output was delayed against the loop
+ * position, so the position has to be rewound by that delay to keep the
+ * audible loop continuous.  Only loops that are simply playing are touched.
+ */
+static void rewind_loop_position (LADSPA_Handle instance, double loopframes)
+{
+	SooperLooperI * pLS = (SooperLooperI *) instance;
+
+	if (!pLS || loopframes <= 0.0) {
+		return;
+	}
+
+	LoopChunk * loop = pLS->headLoopChunk;
+
+	if (!loop || loop->lLoopLength == 0) {
+		return;
+	}
+
+	if (pLS->state != LooperStatePlaying
+	    && pLS->state != LooperStateMuted
+	    && pLS->state != LooperStateOneShot) {
+		return;
+	}
+
+	if (pLS->fCurrRate == 0.0f) {
+		return;
+	}
+
+	const double len = (double) loop->lLoopLength;
+	double step = fmod (loopframes, len);
+	double pos = loop->dCurrPos - step * (double) pLS->fCurrRate;
+
+	pos = fmod (pos, len);
+	if (pos < 0.0) {
+		pos += len;
+	}
+
+	loop->dCurrPos = pos;
+}
+
+
 Looper::Looper (AudioDriver * driver, unsigned int index, unsigned int chan_count, float loopsecs, bool discrete)
 	: _driver (driver), _index(index), _chan_count(chan_count), _loopsecs(loopsecs)
 {
@@ -216,6 +260,8 @@ Looper::initialize (unsigned int index, unsigned int chan_count, float loopsecs,
 	_sync_pending_pulse = 0.0f;
 	_stretch_active = false;
 	_sync_fifo_reset = false;
+	_stretch_consumed = 0.0;
+	_stretch_emitted = 0.0;
 	_tempo_stretch = false;
 	_pending_stretch = false;
 	_pending_stretch_ratio = 0.0;
@@ -1285,6 +1331,31 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 	bool  use_stretch = !resampled && (stretched || pitched);
 
 	if (!use_stretch) {
+		if (_stretch_active) {
+			// We are leaving the stretch path.  The audio we have been
+			// outputting was delayed against the loop position by whatever
+			// the stretcher still holds, and the sync pulses were delayed by
+			// the same amount.  The audible output is about to continue
+			// undelayed, so move the loop position back by that lag.  This
+			// keeps the audible loop (and the slaves following it) continuous.
+			double lag = _stretch_consumed - _stretch_emitted;
+			if (lag < 0.0) {
+				lag = 0.0;
+			}
+			else if (lag > 192000.0) {
+				lag = 192000.0;
+			}
+
+			if (lag > 0.0) {
+				for (unsigned int i=0; i < _chan_count; ++i) {
+					rewind_loop_position (_instances[i], lag);
+				}
+			}
+
+			_stretch_consumed = 0.0;
+			_stretch_emitted = 0.0;
+		}
+
 		// the stretcher is idle, it must be restarted when it is needed again
 		_stretch_active = false;
 	}
@@ -1501,6 +1572,8 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 			// the audio comes out latency samples late, so does the sync
 			_sync_fifo_rpos = - (double) _sync_last_lat * inv;
 			_sync_pending_pulse = 0.0f;
+			_stretch_consumed = 0.0;
+			_stretch_emitted = 0.0;
 			_stretch_active = true;
 			_sync_fifo_reset = false;
 		}
@@ -1601,6 +1674,7 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 				_sync_fifo_wpos += sampsUse;
 			}
 			consumed += (nframes_t) sampsUse;
+			_stretch_consumed += (double) sampsUse;
 
 			// stretch
 			_out_stretcher->process(outbufs, sampsUse, false);
@@ -1609,6 +1683,9 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 		}
 		
 		size_t got = _out_stretcher->retrieve(outbufs, nframes);			
+
+		// the loop time equivalent of what we actually took out of the stretcher
+		_stretch_emitted += (double) got * inv;
 
 		if (got < (size_t) nframes) {
 			// never leave garbage in the output
