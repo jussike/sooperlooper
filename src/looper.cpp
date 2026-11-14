@@ -63,6 +63,80 @@ static const double MaxResamplingRate = 8.0f;
 static const int SrcAudioQuality = SRC_LINEAR;
 
 
+/*
+ * Time-maps a sync buffer from inframes samples to outframes samples while
+ * preserving sync events.  Sync buffers mostly consist of single sample
+ * pulses (values 1.0 and 2.0) and the plugin tests them for exact values, so
+ * a normal interpolating resampler (which smears or drops them) must not be
+ * used.
+ *
+ *  - when shrinking (more input than output frames) every output sample takes
+ *    the maximum of the input span it covers, so no pulse can get lost.
+ *  - when growing, an isolated pulse is emitted exactly once, while values
+ *    that continue over several input samples (e.g. a constant 1.0 or 2.0)
+ *    are held.
+ *
+ * in and out must not overlap.
+ */
+static void resample_sync (const float * in, nframes_t inframes, float * out, nframes_t outframes)
+{
+	if (outframes == 0) {
+		return;
+	}
+
+	if (inframes == 0 || !in) {
+		memset (out, 0, outframes * sizeof(float));
+		return;
+	}
+
+	const double ratio = (double) inframes / (double) outframes;
+
+	if (ratio >= 1.0) {
+		for (nframes_t j = 0; j < outframes; ++j) {
+			nframes_t start = (nframes_t) floor ((double) j * ratio);
+			nframes_t end   = (nframes_t) floor ((double) (j + 1) * ratio);
+
+			if (j == outframes - 1 || end > inframes) {
+				end = inframes;
+			}
+			if (start >= inframes) {
+				start = inframes - 1;
+			}
+			if (end <= start) {
+				end = start + 1;
+			}
+
+			float v = 0.0f;
+			for (nframes_t k = start; k < end; ++k) {
+				if (in[k] > v) {
+					v = in[k];
+				}
+			}
+			out[j] = v;
+		}
+	}
+	else {
+		long lastk = -1;
+
+		for (nframes_t j = 0; j < outframes; ++j) {
+			nframes_t k = (nframes_t) floor ((double) j * ratio);
+			if (k >= inframes) {
+				k = inframes - 1;
+			}
+
+			if ((long) k != lastk) {
+				out[j] = in[k];
+			}
+			else {
+				// only hold values that are part of a continuous run
+				out[j] = (k > 0 && in[k-1] == in[k]) ? in[k] : 0.0f;
+			}
+			lastk = (long) k;
+		}
+	}
+}
+
+
 Looper::Looper (AudioDriver * driver, unsigned int index, unsigned int chan_count, float loopsecs, bool discrete)
 	: _driver (driver), _index(index), _chan_count(chan_count), _loopsecs(loopsecs)
 {
@@ -1352,18 +1426,19 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 	
 #endif
 
-		// resample sync using Rate
-		_src_data.end_of_input = 0;
-		_src_data.src_ratio = _src_in_ratio;
-		_src_data.input_frames = nframes;
-		_src_data.output_frames = (long) ceil (nframes * _stretch_ratio);
-		_src_data.data_in = _use_sync_buf + offset;
-		_src_data.data_out = _src_sync_buffer;
-		src_process (_insync_src_state, &_src_data);
-		
-		//alt_frames = _src_data.output_frames_gen;
+		/*
+		 * The loop is run in "loop time", in chunks that are requested by the
+		 * stretcher.  The sync buffers however are in real time, so:
+		 *   - the real time sync input is mapped onto each loop time chunk
+		 *   - the loop time sync output of all chunks is accumulated and then
+		 *     mapped back into real time in _our_syncout_buf, which is what
+		 *     slave loops read.
+		 */
+		sample_t * sync_in_real = _use_sync_buf + offset;
+		sample_t * sync_acc     = _src_in_buffer;   // loop time sync output accumulator
+		nframes_t  acc_len      = 0;
+		nframes_t  consumed     = 0;                // loop time frames consumed so far
 
-                
 		// stretch output by running the looper as much as we need
 		size_t avail_samps = _out_stretcher->available();
 		//nframes_t needSamples = (nframes_t) ceil(nframes * _stretch_ratio);
@@ -1371,6 +1446,24 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 		while (avail_samps < nframes) {
 			size_t sampsReq = _out_stretcher->getSamplesRequired();
 			size_t sampsUse = min(sampsReq, (size_t) nframes);
+
+			// map the real time span covered by this chunk to its sync input
+			double real_start_d = (double) consumed * _stretch_ratio;
+			double real_end_d   = (double) (consumed + sampsUse) * _stretch_ratio;
+
+			if (sampsUse > 0) {
+				if (real_start_d < (double) nframes) {
+					nframes_t rs = (nframes_t) floor (real_start_d);
+					nframes_t re = (nframes_t) floor (min (real_end_d, (double) nframes));
+					if (re <= rs) re = rs + 1;
+					if (re > nframes) re = nframes;
+					resample_sync (sync_in_real + rs, re - rs, _src_sync_buffer, (nframes_t) sampsUse);
+				}
+				else {
+					// we have consumed more than this call's worth of time
+					memset (_src_sync_buffer, 0, sampsUse * sizeof(float));
+				}
+			}
 
 			// run the looper(s)
 			for (unsigned int i=0; i < _chan_count; ++i) {
@@ -1392,6 +1485,13 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 				
 			}
 
+			// keep the loop time sync output of channel 0
+			if (sampsUse > 0 && ((size_t) acc_len + sampsUse) <= (size_t) _src_buffer_len) {
+				memcpy (sync_acc + acc_len, _src_sync_buffer, sampsUse * sizeof(float));
+				acc_len += (nframes_t) sampsUse;
+			}
+			consumed += (nframes_t) sampsUse;
+
 			// stretch
 			_out_stretcher->process(outbufs, sampsUse, false);
 				
@@ -1399,6 +1499,9 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 		}
 		
 		_out_stretcher->retrieve(outbufs, nframes);			
+
+		// map the sync output back into real time for the slave loops
+		resample_sync (sync_acc, acc_len, _our_syncout_buf + offset, nframes);
 		
 	}
 	else 
