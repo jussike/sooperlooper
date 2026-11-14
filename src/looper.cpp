@@ -781,6 +781,13 @@ Looper::recompute_latencies()
 		//ports[OutputLatency] += _out_stretcher->getLatency();
 		ports[SyncOffsetSamples] = _out_stretcher->getLatency();
 	}
+	else {
+		// Not stretching (anymore): the stretcher latency no longer applies.
+		// Without this reset the old latency stays in the port after the
+		// stretch ratio returns to 1.0 and keeps shifting the loop positions
+		// the plugin computes for trigger/oneshot/playback sync.
+		ports[SyncOffsetSamples] = 0.0f;
+	}
 		
 
 	//cerr << "input lat: " << ports[InputLatency] << endl;
