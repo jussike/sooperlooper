@@ -193,20 +193,20 @@ LoopControl::LoopControl (const wxString & rcdir)
 	cerr << "slgui: our URL is " << _our_url << endl;
 	
 	/* add handler for control param callbacks, first is loop index , 2nd arg ctrl string, 3nd arg value */
-	lo_server_add_method(_osc_server, "/ctrl", "isf", LoopControl::_control_handler, this);
-	lo_server_add_method(_osc_server, "/prop", "iss", LoopControl::_property_handler, this);
+	lo_server_add_method(_osc_server, "/ctrl", "isf", (lo_method_handler) LoopControl::_control_handler, this);
+	lo_server_add_method(_osc_server, "/prop", "iss", (lo_method_handler) LoopControl::_property_handler, this);
 
 	// pingack expects: s:engine_url s:version i:loopcount
-	lo_server_add_method(_osc_server, "/pingack", "ssi", LoopControl::_pingack_handler, this);
-	lo_server_add_method(_osc_server, "/pingack", "ssii", LoopControl::_pingack_handler, this);
+	lo_server_add_method(_osc_server, "/pingack", "ssi", (lo_method_handler) LoopControl::_pingack_handler, this);
+	lo_server_add_method(_osc_server, "/pingack", "ssii", (lo_method_handler) LoopControl::_pingack_handler, this);
 
-	lo_server_add_method(_osc_server, "/alive_resp", "ssi", LoopControl::_alive_handler, this);
-	lo_server_add_method(_osc_server, "/alive_resp", "ssii", LoopControl::_alive_handler, this);
+	lo_server_add_method(_osc_server, "/alive_resp", "ssi", (lo_method_handler) LoopControl::_alive_handler, this);
+	lo_server_add_method(_osc_server, "/alive_resp", "ssii", (lo_method_handler) LoopControl::_alive_handler, this);
 
-	lo_server_add_method(_osc_server, "/error", "ss", LoopControl::_error_handler, this);
+	lo_server_add_method(_osc_server, "/error", "ss", (lo_method_handler) LoopControl::_error_handler, this);
 	
 	/* add handler for recving midi bindings, s:status s:serialized binding */
-	lo_server_add_method(_osc_server, "/recv_midi_bindings", "ss", LoopControl::_midi_binding_handler, this);
+	lo_server_add_method(_osc_server, "/recv_midi_bindings", "ss", (lo_method_handler) LoopControl::_midi_binding_handler, this);
 	
 	_pingack = false;
 	_waiting = 0;

@@ -418,10 +418,10 @@ int main(int argc, char *argv[])
     our_url = lo_server_get_url (osc_server);
     
     /* add handler for control param callbacks, first arg ctrl string, 2nd arg value */
-    lo_server_add_method(osc_server, "/ctrl", "isf", ctrl_handler, NULL);
+    lo_server_add_method(osc_server, "/ctrl", "isf", (lo_method_handler) ctrl_handler, NULL);
 
     // pingack expects: s:engine_url s:version i:loopcount
-    lo_server_add_method(osc_server, "/pingack", "ssi", pingack_handler, NULL);
+    lo_server_add_method(osc_server, "/pingack", "ssi", (lo_method_handler) pingack_handler, NULL);
     
     // start up our thread
     pthread_create (&osc_thread, NULL, osc_receiver, NULL);
