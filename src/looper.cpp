@@ -261,9 +261,9 @@ Looper::initialize (unsigned int index, unsigned int chan_count, float loopsecs,
 	_sync_pending_pulse = 0.0f;
 	_stretch_active = false;
 	_sync_fifo_reset = false;
-	_stretch_consumed = 0.0;
-	_stretch_emitted = 0.0;
-	_stretch_lat_loop = 0.0;
+	_stretch_seg_head = 0;
+	_stretch_seg_count = 0;
+	_stretch_lat_corr = 0.0;
 	_tempo_stretch = false;
 	_pending_stretch = false;
 	_pending_stretch_ratio = 0.0;
@@ -854,12 +854,82 @@ Looper::shift_loop_positions (double loopframes)
 }
 
 void
+Looper::stretch_map_clear ()
+{
+	_stretch_seg_head = 0;
+	_stretch_seg_count = 0;
+}
+
+void
+Looper::stretch_map_push (double loopframes, double realframes)
+{
+	if (realframes <= 0.0) {
+		return;
+	}
+
+	if (_stretch_seg_count == (unsigned int) StretchSegCount) {
+		// full, merge into the newest segment (slightly less exact)
+		unsigned int idx = (_stretch_seg_head + _stretch_seg_count - 1) % StretchSegCount;
+		_stretch_segs[idx].loop += loopframes;
+		_stretch_segs[idx].real += realframes;
+		return;
+	}
+
+	unsigned int idx = (_stretch_seg_head + _stretch_seg_count) % StretchSegCount;
+	_stretch_segs[idx].loop = loopframes;
+	_stretch_segs[idx].real = realframes;
+	++_stretch_seg_count;
+}
+
+double
+Looper::stretch_map_pop (double realframes, double fallback_inv)
+{
+	double loopframes = 0.0;
+
+	while (realframes > 0.0 && _stretch_seg_count > 0) {
+		StretchSeg & seg = _stretch_segs[_stretch_seg_head];
+
+		if (seg.real <= realframes) {
+			loopframes += seg.loop;
+			realframes -= seg.real;
+			_stretch_seg_head = (_stretch_seg_head + 1) % StretchSegCount;
+			--_stretch_seg_count;
+		}
+		else {
+			double part = seg.loop * (realframes / seg.real);
+			loopframes += part;
+			seg.loop -= part;
+			seg.real -= realframes;
+			realframes = 0.0;
+		}
+	}
+
+	if (realframes > 0.0) {
+		// the stretcher gave more than we accounted for, use the current ratio
+		loopframes += realframes * fallback_inv;
+	}
+
+	return loopframes;
+}
+
+double
+Looper::stretch_map_pending () const
+{
+	double sum = 0.0;
+	for (unsigned int n = 0; n < _stretch_seg_count; ++n) {
+		sum += _stretch_segs[(_stretch_seg_head + n) % StretchSegCount].loop;
+	}
+	return sum;
+}
+
+void
 Looper::settle_stretch_position ()
 {
 	// The loop position is ahead of the audible (delayed) stretcher output by
-	// this many loop time samples.  Take it back so the audible loop simply
-	// continues where the last emitted sample was.
-	double lag = _stretch_consumed - _stretch_emitted + _stretch_lat_loop;
+	// the loop time still held by the stretcher (including the start delay we
+	// ran ahead by).  Take it back so the audible loop simply continues where
+	// the last emitted sample was.
+	double lag = stretch_map_pending () + _stretch_lat_corr;
 
 	if (lag > 192000.0) {
 		lag = 192000.0;
@@ -872,9 +942,8 @@ Looper::settle_stretch_position ()
 		shift_loop_positions (-lag);
 	}
 
-	_stretch_consumed = 0.0;
-	_stretch_emitted = 0.0;
-	_stretch_lat_loop = 0.0;
+	stretch_map_clear ();
+	_stretch_lat_corr = 0.0;
 }
 
 bool Looper::has_loop() const
@@ -1596,31 +1665,34 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 			_sync_fifo_wpos = 0;
 			_sync_fifo_ke = 0;
 			_sync_last_lat = _out_stretcher->getLatency();
-			_stretch_lat_loop = (double) _sync_last_lat * inv;
+			const double startlat = (double) _sync_last_lat * inv;
 			// the audio comes out latency samples late, so does the sync
-			_sync_fifo_rpos = - _stretch_lat_loop;
+			_sync_fifo_rpos = - startlat;
 			_sync_pending_pulse = 0.0f;
-			_stretch_consumed = 0.0;
-			_stretch_emitted = 0.0;
+			stretch_map_clear ();
+			_stretch_lat_corr = 0.0;
 			_stretch_active = true;
 			_sync_fifo_reset = false;
 
 			// The stretcher output lags what we feed it by its latency.  Run
 			// the loop that far ahead so the delayed audio (and the delayed
 			// sync pulses) end up on the original time line instead of being
-			// late against the slaves.
-			if (_stretch_lat_loop > 0.0) {
-				shift_loop_positions (_stretch_lat_loop);
+			// late against the slaves.  The start delay is the first segment
+			// of the time map, at the ratio in effect now.
+			if (startlat > 0.0) {
+				stretch_map_push (startlat, (double) _sync_last_lat);
+				shift_loop_positions (startlat);
 			}
 		}
 
 		{
 			size_t lat = _out_stretcher->getLatency();
 			if (lat != _sync_last_lat) {
-				_sync_fifo_rpos -= ((double) lat - (double) _sync_last_lat) * inv;
+				double d = ((double) lat - (double) _sync_last_lat) * inv;
+				_sync_fifo_rpos -= d;
+				_stretch_lat_corr += d;
 				_sync_last_lat = lat;
 			}
-			_stretch_lat_loop = (double) _sync_last_lat * inv;
 		}
 
 		// The plugin must see every value of the Multi control port, also
@@ -1713,7 +1785,10 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 				_sync_fifo_wpos += sampsUse;
 			}
 			consumed += (nframes_t) sampsUse;
-			_stretch_consumed += (double) sampsUse;
+			if (sampsUse > 0) {
+				// remember what this chunk becomes in real time at this ratio
+				stretch_map_push ((double) sampsUse, (double) sampsUse * ratio);
+			}
 
 			// stretch
 			_out_stretcher->process(outbufs, sampsUse, false);
@@ -1723,8 +1798,9 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 		
 		size_t got = _out_stretcher->retrieve(outbufs, nframes);			
 
-		// the loop time equivalent of what we actually took out of the stretcher
-		_stretch_emitted += (double) got * inv;
+		// the loop time equivalent of what we actually took out of the
+		// stretcher, using the ratio each part was fed with
+		const double popped = stretch_map_pop ((double) got, inv);
 
 		if (got < (size_t) nframes) {
 			// never leave garbage in the output
@@ -1748,8 +1824,12 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 				ke = wpos - _sync_fifo_size / 2;
 			}
 
+			// loop time per real time sample for the audio emitted this block
+			const double block_inv = (got > 0) ? (popped / (double) got) : 0.0;
+
 			for (nframes_t j = 0; j < nframes; ++j) {
-				double posend = rpos + (double) (j + 1) * inv;
+				size_t steps = ((size_t) j + 1 < got) ? ((size_t) j + 1) : got;
+				double posend = rpos + (double) steps * block_inv;
 				long long hi = (long long) floor (posend);
 				float v = 0.0f;
 
@@ -1777,7 +1857,7 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 			}
 
 			_sync_fifo_ke = ke;
-			_sync_fifo_rpos = rpos + (double) nframes * inv;
+			_sync_fifo_rpos = rpos + popped;
 		}
 	}
 	else 
