@@ -21,6 +21,8 @@
 #define __sooperlooper_looper__
 
 #include <string>
+#include <stdint.h>
+#include <cstddef>
 
 #if HAVE_CONFIG_H
 #include <config.h>
@@ -246,6 +248,22 @@ class Looper
 	bool                               _tempo_stretch;
 	volatile bool                      _pending_stretch;
 	volatile double                    _pending_stretch_ratio;
+
+	// Delay line for the sync output of the stretch/pitch path.  The loop
+	// produces its sync output in loop time, ahead of the (latent) stretched
+	// audio.  Writing it through this delay line makes the pulses leave at the
+	// same time as the audio they belong to, independent of how the stretcher
+	// chunks its input requests.
+	float *               _sync_fifo;
+	uint64_t              _sync_fifo_size;     // power of two
+	uint64_t              _sync_fifo_mask;
+	uint64_t              _sync_fifo_wpos;     // loop time samples written so far
+	uint64_t              _sync_fifo_ke;       // next loop time sample to be emitted
+	double                _sync_fifo_rpos;     // loop time read position (may be negative)
+	size_t                _sync_last_lat;      // stretcher latency used for the read position
+	float                 _sync_pending_pulse; // pulse from a command pre-pass, not yet written
+	bool                  _stretch_active;     // stretch path was used by the previous call
+	bool                  _sync_fifo_reset;    // stretchers were reset, restart the delay line
 
 	bool _ok;
 	volatile bool request_pending;

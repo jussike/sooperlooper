@@ -206,6 +206,16 @@ Looper::initialize (unsigned int index, unsigned int chan_count, float loopsecs,
 	_stretch_ratio = 1.0;
 	_pitch_shift = 0.0;
 	_stretch_buffer = 0;
+	_sync_fifo = 0;
+	_sync_fifo_size = 0;
+	_sync_fifo_mask = 0;
+	_sync_fifo_wpos = 0;
+	_sync_fifo_ke = 0;
+	_sync_fifo_rpos = 0.0;
+	_sync_last_lat = 0;
+	_sync_pending_pulse = 0.0f;
+	_stretch_active = false;
+	_sync_fifo_reset = false;
 	_tempo_stretch = false;
 	_pending_stretch = false;
 	_pending_stretch_ratio = 0.0;
@@ -483,6 +493,11 @@ Looper::destroy()
 		delete [] _stretch_buffer;
 		_stretch_buffer = 0;
 	}
+
+	if (_sync_fifo) {
+		delete [] _sync_fifo;
+		_sync_fifo = 0;
+	}
 }
 
 
@@ -683,6 +698,27 @@ Looper::set_buffer_size (nframes_t bufsize)
 			delete [] _stretch_buffer;
 		}
 		_stretch_buffer = new float[_src_buffer_len * _chan_count];
+
+		// delay line for the sync output of the stretch/pitch path
+		if (_sync_fifo) {
+			delete [] _sync_fifo;
+		}
+		uint64_t fifo_want = (uint64_t) _src_buffer_len * 4;
+		if (fifo_want < 65536) {
+			fifo_want = 65536;
+		}
+		_sync_fifo_size = 65536;
+		while (_sync_fifo_size < fifo_want) {
+			_sync_fifo_size <<= 1;
+		}
+		_sync_fifo_mask = _sync_fifo_size - 1;
+		_sync_fifo = new float[_sync_fifo_size];
+		memset (_sync_fifo, 0, sizeof(float) * _sync_fifo_size);
+		_sync_fifo_wpos = 0;
+		_sync_fifo_ke = 0;
+		_sync_fifo_rpos = 0.0;
+		_sync_pending_pulse = 0.0f;
+		_sync_fifo_reset = true;
 
 		// set automatic latency values if appropriate
 		recompute_latencies();
@@ -1176,6 +1212,8 @@ Looper::run (nframes_t offset, nframes_t nframes)
 		{
 			_in_stretcher->reset();
 			_out_stretcher->reset();
+			// the sync delay line must restart together with the stretcher
+			_sync_fifo_reset = true;
 		}
 		_stretch_ratio = newratio;
 		_in_stretcher->setTimeRatio(1.0/_stretch_ratio);
@@ -1237,6 +1275,12 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 	bool  resampled = ports[Rate] != 1.0f;
 	bool  stretched = _stretch_ratio != 1.0;
 	bool  pitched = _pitch_shift != 0.0;
+	bool  use_stretch = !resampled && (stretched || pitched);
+
+	if (!use_stretch) {
+		// the stretcher is idle, it must be restarted when it is needed again
+		_stretch_active = false;
+	}
 
 	if (resampled) {
 		_src_data.end_of_input = 0;
@@ -1421,21 +1465,46 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 			
 		}
 	}
-	else if (stretched || pitched) 
+	else if (use_stretch) 
 	{
 		/*
 		 * The loop is run in "loop time", in chunks that are requested by the
 		 * stretcher.  The sync buffers however are in real time, so:
 		 *   - the real time sync input is mapped onto each loop time chunk
-		 *   - the loop time sync output of all chunks is accumulated and then
-		 *     mapped back into real time in _our_syncout_buf, which is what
-		 *     slave loops read.
+		 *   - the loop time sync output of every chunk is written into a
+		 *     delay line (_sync_fifo).  It is read back in real time with the
+		 *     same delay the stretcher puts on the audio, so the sync pulses
+		 *     that slave loops read in _our_syncout_buf line up with the
+		 *     audible output of this loop and do not depend on how the
+		 *     stretcher chunks its input requests.
 		 */
 		sample_t * sync_in_real = _use_sync_buf + offset;
-		sample_t * sync_acc     = _src_in_buffer;   // loop time sync output accumulator
-		nframes_t  acc_len      = 0;
 		nframes_t  consumed     = 0;                // loop time frames consumed so far
-		float      pending_pulse = 0.0f;
+		const double ratio      = (_stretch_ratio > 0.0) ? _stretch_ratio : 1.0;
+		const double inv        = 1.0 / ratio;      // loop time per real time
+
+		if (!_stretch_active || _sync_fifo_reset) {
+			if (!_stretch_active) {
+				// drop anything the stretcher still holds from earlier use
+				_out_stretcher->reset();
+			}
+			_sync_fifo_wpos = 0;
+			_sync_fifo_ke = 0;
+			_sync_last_lat = _out_stretcher->getLatency();
+			// the audio comes out latency samples late, so does the sync
+			_sync_fifo_rpos = - (double) _sync_last_lat * inv;
+			_sync_pending_pulse = 0.0f;
+			_stretch_active = true;
+			_sync_fifo_reset = false;
+		}
+
+		{
+			size_t lat = _out_stretcher->getLatency();
+			if (lat != _sync_last_lat) {
+				_sync_fifo_rpos -= ((double) lat - (double) _sync_last_lat) * inv;
+				_sync_last_lat = lat;
+			}
+		}
 
 		// A command that is pending must always reach the plugin, even if
 		// the stretcher does not need any more input during this call
@@ -1457,8 +1526,11 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 				descriptor->run (_instances[i], 0);
 			}
 
-			// the command may have written a sync pulse for slaves at index 0
-			pending_pulse = _src_sync_buffer[0];
+			// the command may have written a sync pulse for slaves at index 0,
+			// it belongs to the next loop time sample that gets written
+			if (_src_sync_buffer[0] > _sync_pending_pulse) {
+				_sync_pending_pulse = _src_sync_buffer[0];
+			}
 		}
 
 		// stretch output by running the looper as much as we need
@@ -1470,8 +1542,8 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 			size_t sampsUse = min(sampsReq, (size_t) nframes);
 
 			// map the real time span covered by this chunk to its sync input
-			double real_start_d = (double) consumed * _stretch_ratio;
-			double real_end_d   = (double) (consumed + sampsUse) * _stretch_ratio;
+			double real_start_d = (double) consumed * ratio;
+			double real_end_d   = (double) (consumed + sampsUse) * ratio;
 
 			if (sampsUse > 0) {
 				if (real_start_d < (double) nframes) {
@@ -1507,10 +1579,19 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 				
 			}
 
-			// keep the loop time sync output of channel 0
-			if (sampsUse > 0 && ((size_t) acc_len + sampsUse) <= (size_t) _src_buffer_len) {
-				memcpy (sync_acc + acc_len, _src_sync_buffer, sampsUse * sizeof(float));
-				acc_len += (nframes_t) sampsUse;
+			// write the loop time sync output of channel 0 into the delay line
+			if (sampsUse > 0) {
+				if (_sync_pending_pulse != 0.0f) {
+					if (_src_sync_buffer[0] < _sync_pending_pulse) {
+						_src_sync_buffer[0] = _sync_pending_pulse;
+					}
+					_sync_pending_pulse = 0.0f;
+				}
+
+				for (size_t n=0; n < sampsUse; ++n) {
+					_sync_fifo[(_sync_fifo_wpos + n) & _sync_fifo_mask] = _src_sync_buffer[n];
+				}
+				_sync_fifo_wpos += sampsUse;
 			}
 			consumed += (nframes_t) sampsUse;
 
@@ -1529,19 +1610,52 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 			}
 		}
 
-		// merge any pulse generated by the command pre-pass
-		if (pending_pulse != 0.0f) {
-			if (acc_len == 0) {
-				sync_acc[0] = pending_pulse;
-				acc_len = 1;
-			}
-			else if (pending_pulse > sync_acc[0]) {
-				sync_acc[0] = pending_pulse;
-			}
-		}
+		// Read the delay line back in real time for the slave loops.
+		// Every loop time sample is emitted exactly once: output sample j takes
+		// the maximum of the samples between the previous window end and
+		// floor(rpos + (j+1)/ratio), so pulses can neither get lost nor doubled.
+		if (nframes > 0) {
+			float * sync_out = _our_syncout_buf + offset;
+			uint64_t ke = _sync_fifo_ke;
+			const uint64_t wpos = _sync_fifo_wpos;
+			const double rpos = _sync_fifo_rpos;
 
-		// map the sync output back into real time for the slave loops
-		resample_sync (sync_acc, acc_len, _our_syncout_buf + offset, nframes);
+			// never read data the ring has already overwritten
+			if (wpos - ke > _sync_fifo_size / 2) {
+				ke = wpos - _sync_fifo_size / 2;
+			}
+
+			for (nframes_t j = 0; j < nframes; ++j) {
+				double posend = rpos + (double) (j + 1) * inv;
+				long long hi = (long long) floor (posend);
+				float v = 0.0f;
+
+				if (hi > (long long) wpos) {
+					// not produced yet, wait for it
+					hi = (long long) wpos;
+				}
+
+				if (hi > (long long) ke) {
+					for (uint64_t k = ke; k < (uint64_t) hi; ++k) {
+						float s = _sync_fifo[k & _sync_fifo_mask];
+						if (s > v) {
+							v = s;
+						}
+					}
+					ke = (uint64_t) hi;
+				}
+				else if (ke > 0 && ke < wpos
+					 && _sync_fifo[(ke - 1) & _sync_fifo_mask] == _sync_fifo[ke & _sync_fifo_mask]) {
+					// only hold values that are part of a continuous run
+					v = _sync_fifo[ke & _sync_fifo_mask];
+				}
+
+				sync_out[j] = v;
+			}
+
+			_sync_fifo_ke = ke;
+			_sync_fifo_rpos = rpos + (double) nframes * inv;
+		}
 	}
 	else 
 	{
