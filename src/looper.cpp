@@ -139,17 +139,18 @@ static void resample_sync (const float * in, nframes_t inframes, float * out, nf
 
 
 /*
- * Moves the playback position of a plugin instance back by loopframes (loop
- * time samples, in playback direction).  Used when the stretcher is bypassed:
- * while it was in use the audible output was delayed against the loop
- * position, so the position has to be rewound by that delay to keep the
- * audible loop continuous.  Only loops that are simply playing are touched.
+ * Moves the playback position of a plugin instance by loopframes (loop time
+ * samples).  A positive value moves the position forward in playback
+ * direction, a negative value moves it back.  Used when the stretcher is
+ * started (run the loop ahead of the delayed stretcher output) and when it is
+ * bypassed (take back what the stretcher still holds).  Only loops that are
+ * simply playing are touched.
  */
-static void rewind_loop_position (LADSPA_Handle instance, double loopframes)
+static void shift_loop_position (LADSPA_Handle instance, double loopframes)
 {
 	SooperLooperI * pLS = (SooperLooperI *) instance;
 
-	if (!pLS || loopframes <= 0.0) {
+	if (!pLS || loopframes == 0.0) {
 		return;
 	}
 
@@ -171,7 +172,7 @@ static void rewind_loop_position (LADSPA_Handle instance, double loopframes)
 
 	const double len = (double) loop->lLoopLength;
 	double step = fmod (loopframes, len);
-	double pos = loop->dCurrPos - step * (double) pLS->fCurrRate;
+	double pos = loop->dCurrPos + step * (double) pLS->fCurrRate;
 
 	pos = fmod (pos, len);
 	if (pos < 0.0) {
@@ -262,6 +263,7 @@ Looper::initialize (unsigned int index, unsigned int chan_count, float loopsecs,
 	_sync_fifo_reset = false;
 	_stretch_consumed = 0.0;
 	_stretch_emitted = 0.0;
+	_stretch_lat_loop = 0.0;
 	_tempo_stretch = false;
 	_pending_stretch = false;
 	_pending_stretch_ratio = 0.0;
@@ -825,7 +827,10 @@ Looper::recompute_latencies()
 	// add any latency due to timestretch
 	if (_stretch_ratio != 1.0) {
 		//ports[OutputLatency] += _out_stretcher->getLatency();
-		ports[SyncOffsetSamples] = _out_stretcher->getLatency();
+		// the plugin adds this to loop positions, so it has to be in loop
+		// time: the loop advances 1/ratio samples per real time sample
+		double lat = (double) _out_stretcher->getLatency();
+		ports[SyncOffsetSamples] = (float) ((_stretch_ratio > 0.0) ? (lat / _stretch_ratio) : lat);
 	}
 	else {
 		// Not stretching (anymore): the stretcher latency no longer applies.
@@ -838,6 +843,38 @@ Looper::recompute_latencies()
 
 	//cerr << "input lat: " << ports[InputLatency] << endl;
 	//cerr << "output lat: " << ports[OutputLatency] << endl;
+}
+
+void
+Looper::shift_loop_positions (double loopframes)
+{
+	for (unsigned int i=0; i < _chan_count; ++i) {
+		shift_loop_position (_instances[i], loopframes);
+	}
+}
+
+void
+Looper::settle_stretch_position ()
+{
+	// The loop position is ahead of the audible (delayed) stretcher output by
+	// this many loop time samples.  Take it back so the audible loop simply
+	// continues where the last emitted sample was.
+	double lag = _stretch_consumed - _stretch_emitted + _stretch_lat_loop;
+
+	if (lag > 192000.0) {
+		lag = 192000.0;
+	}
+	else if (lag < -192000.0) {
+		lag = -192000.0;
+	}
+
+	if (lag != 0.0) {
+		shift_loop_positions (-lag);
+	}
+
+	_stretch_consumed = 0.0;
+	_stretch_emitted = 0.0;
+	_stretch_lat_loop = 0.0;
 }
 
 bool Looper::has_loop() const
@@ -1332,28 +1369,13 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 
 	if (!use_stretch) {
 		if (_stretch_active) {
-			// We are leaving the stretch path.  The audio we have been
-			// outputting was delayed against the loop position by whatever
-			// the stretcher still holds, and the sync pulses were delayed by
-			// the same amount.  The audible output is about to continue
-			// undelayed, so move the loop position back by that lag.  This
-			// keeps the audible loop (and the slaves following it) continuous.
-			double lag = _stretch_consumed - _stretch_emitted;
-			if (lag < 0.0) {
-				lag = 0.0;
-			}
-			else if (lag > 192000.0) {
-				lag = 192000.0;
-			}
-
-			if (lag > 0.0) {
-				for (unsigned int i=0; i < _chan_count; ++i) {
-					rewind_loop_position (_instances[i], lag);
-				}
-			}
-
-			_stretch_consumed = 0.0;
-			_stretch_emitted = 0.0;
+			// We are leaving the stretch path.  While it was active the loop
+			// ran ahead of the audible output by the stretcher latency (we
+			// started it that far ahead so the delayed output stays on the
+			// original time line).  The audible output is about to continue
+			// undelayed, so take that lead back.  This keeps the audible loop
+			// continuous and in time with the slaves.
+			settle_stretch_position ();
 		}
 
 		// the stretcher is idle, it must be restarted when it is needed again
@@ -1562,20 +1584,34 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 		const double inv        = 1.0 / ratio;      // loop time per real time
 
 		if (!_stretch_active || _sync_fifo_reset) {
-			if (!_stretch_active) {
+			if (_stretch_active) {
+				// restarting while already stretching: settle the position
+				// of the previous run first
+				settle_stretch_position ();
+			}
+			else {
 				// drop anything the stretcher still holds from earlier use
 				_out_stretcher->reset();
 			}
 			_sync_fifo_wpos = 0;
 			_sync_fifo_ke = 0;
 			_sync_last_lat = _out_stretcher->getLatency();
+			_stretch_lat_loop = (double) _sync_last_lat * inv;
 			// the audio comes out latency samples late, so does the sync
-			_sync_fifo_rpos = - (double) _sync_last_lat * inv;
+			_sync_fifo_rpos = - _stretch_lat_loop;
 			_sync_pending_pulse = 0.0f;
 			_stretch_consumed = 0.0;
 			_stretch_emitted = 0.0;
 			_stretch_active = true;
 			_sync_fifo_reset = false;
+
+			// The stretcher output lags what we feed it by its latency.  Run
+			// the loop that far ahead so the delayed audio (and the delayed
+			// sync pulses) end up on the original time line instead of being
+			// late against the slaves.
+			if (_stretch_lat_loop > 0.0) {
+				shift_loop_positions (_stretch_lat_loop);
+			}
 		}
 
 		{
@@ -1584,12 +1620,15 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 				_sync_fifo_rpos -= ((double) lat - (double) _sync_last_lat) * inv;
 				_sync_last_lat = lat;
 			}
+			_stretch_lat_loop = (double) _sync_last_lat * inv;
 		}
 
-		// A command that is pending must always reach the plugin, even if
-		// the stretcher does not need any more input during this call
-		// (otherwise run() would reset the control port and drop it).
-		if (ports[Multi] >= 0.0f) {
+		// The plugin must see every value of the Multi control port, also
+		// the reset to -1 after a command.  If it did not (because the
+		// stretcher needs no input during this call) it would ignore the
+		// next press of the same command.  So always present the port with
+		// a zero frame run.
+		{
 			_src_sync_buffer[0] = 0.0f;
 
 			for (unsigned int i=0; i < _chan_count; ++i) {

@@ -144,6 +144,12 @@ class Looper
 	void run_loops (nframes_t offset, nframes_t nframes);
 	void run_loops_resampled (nframes_t offset, nframes_t nframes);
 
+	// moves the loop position of all channels (loop time samples, positive = forward)
+	void shift_loop_positions (double loopframes);
+
+	// takes back the lead the loop has over the audible stretcher output
+	void settle_stretch_position ();
+
 	static void compute_peak (sample_t *buf, nframes_t nsamples, float& peak) {
 		float p = peak;
 		
@@ -271,6 +277,7 @@ class Looper
 	// the audible loop stays continuous and in sync with the slaves.
 	double                _stretch_consumed;   // loop time samples fed to the stretcher
 	double                _stretch_emitted;    // loop time equivalent of the output taken from it
+	double                _stretch_lat_loop;   // stretcher latency in loop time samples
 
 	bool _ok;
 	volatile bool request_pending;
