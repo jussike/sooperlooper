@@ -25,6 +25,7 @@
 #include "looper.hpp"
 
 #include <iostream>
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
 #include <cmath>
@@ -655,8 +656,13 @@ Looper::set_buffer_size (nframes_t bufsize)
 		
 		_our_syncin_buf = new float[_buffersize];
 		_our_syncout_buf = new float[_buffersize];
+		memset (_our_syncin_buf, 0, sizeof(float) * _buffersize);
+		memset (_our_syncout_buf, 0, sizeof(float) * _buffersize);
+
 		// big enough for use with resampling too
-		_dummy_buf = new float[(nframes_t) ceil (_buffersize * MaxResamplingRate)];
+		nframes_t dummylen = (nframes_t) ceil (_buffersize * MaxResamplingRate);
+		_dummy_buf = new float[dummylen];
+		memset (_dummy_buf, 0, sizeof(float) * dummylen);
 		
 		if (_use_sync_buf == 0) {
 			_use_sync_buf = _our_syncin_buf;
@@ -670,7 +676,12 @@ Looper::set_buffer_size (nframes_t bufsize)
 		_src_buffer_len = (nframes_t) ceil (_buffersize * MaxResamplingRate);
 		_src_sync_buffer = new float[_src_buffer_len];
 		_src_in_buffer = new float[_src_buffer_len];
+		memset (_src_sync_buffer, 0, sizeof(float) * _src_buffer_len);
+		memset (_src_in_buffer, 0, sizeof(float) * _src_buffer_len);
 
+		if (_stretch_buffer) {
+			delete [] _stretch_buffer;
+		}
 		_stretch_buffer = new float[_src_buffer_len * _chan_count];
 
 		// set automatic latency values if appropriate
@@ -1216,6 +1227,7 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 {
 	//LADSPA_Data * inbuf = 0 , *outbuf = 0, *real_inbuf = 0;
 	nframes_t alt_frames = nframes;
+	nframes_t sync_frames = nframes; // valid frames in _src_sync_buffer (resampled path)
 	float currdry = _curr_dry;
     float currwet = _curr_wet;
 	float curr_ing = _curr_input_gain;
@@ -1228,18 +1240,8 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 
 	if (resampled) {
 		_src_data.end_of_input = 0;
-		
-		// resample input audio and sync using Rate
-		_src_data.src_ratio = _src_in_ratio;
-		_src_data.input_frames = nframes;
-		_src_data.output_frames = (long) ceil (nframes * _src_in_ratio);
-		
-		// sync input
-		_src_data.data_in = _use_sync_buf + offset;
-		_src_data.data_out = _src_sync_buffer;
-		src_process (_insync_src_state, &_src_data);
-		
-		alt_frames = _src_data.output_frames_gen;
+		// the sync input is brought into the rate adjusted time domain
+		// below, once we know how many frames the audio resampler gives us
 	}
 
 	// get common outputs
@@ -1346,6 +1348,18 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 			
 			alt_frames = _src_data.output_frames_gen;
 
+			if (i == 0) {
+				// bring the sync input into the rate adjusted time domain.
+				// This must not use an interpolating resampler: that smears
+				// or drops the single sample sync pulses.
+				sync_frames = alt_frames;
+				resample_sync (_use_sync_buf + offset, nframes, _src_sync_buffer, sync_frames);
+			}
+			else if (alt_frames > sync_frames) {
+				// should not happen, but never feed the plugin stale sync data
+				memset (_src_sync_buffer + sync_frames, 0, (alt_frames - sync_frames) * sizeof(float));
+			}
+
 			descriptor->connect_port (_instances[i], AudioInputPort, (LADSPA_Data*) _src_in_buffer);
 			descriptor->connect_port (_instances[i], AudioOutputPort, (LADSPA_Data*) _src_in_buffer);
 
@@ -1409,23 +1423,6 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 	}
 	else if (stretched || pitched) 
 	{
-#if 0
-		nframes_t needSamples = (nframes_t) floor(nframes / _stretch_ratio);
-		//cerr << "in samps req: " << sampsReq << "  need: " << needSamples << endl;
-		alt_frames = needSamples;
-		
-		// stretch input
-		_in_stretcher->process(inbufs, (size_t) nframes, false);
-		size_t avail_samps = _in_stretcher->available();			
-		size_t got_samps = _in_stretcher->retrieve(&_src_in_buffer, avail_samps);
-		if (got_samps < alt_frames) {
-			// clear the remaining
-			cerr << "clearing in " << alt_frames - got_samps << "  avail: " << avail_samps << "  got samps: " << got_samps << endl;
-			memset(&_src_in_buffer[got_samps], 0, (alt_frames - got_samps) * sizeof(float));
-		}
-	
-#endif
-
 		/*
 		 * The loop is run in "loop time", in chunks that are requested by the
 		 * stretcher.  The sync buffers however are in real time, so:
@@ -1438,12 +1435,37 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 		sample_t * sync_acc     = _src_in_buffer;   // loop time sync output accumulator
 		nframes_t  acc_len      = 0;
 		nframes_t  consumed     = 0;                // loop time frames consumed so far
+		float      pending_pulse = 0.0f;
+
+		// A command that is pending must always reach the plugin, even if
+		// the stretcher does not need any more input during this call
+		// (otherwise run() would reset the control port and drop it).
+		if (ports[Multi] >= 0.0f) {
+			_src_sync_buffer[0] = 0.0f;
+
+			for (unsigned int i=0; i < _chan_count; ++i) {
+				descriptor->connect_port (_instances[i], AudioInputPort, (LADSPA_Data*) outbufs[i]);
+				descriptor->connect_port (_instances[i], AudioOutputPort, (LADSPA_Data*) outbufs[i]);
+				if (i == 0) {
+					descriptor->connect_port (_instances[i], SyncInputPort, (LADSPA_Data*) _src_sync_buffer);
+					descriptor->connect_port (_instances[i], SyncOutputPort, (LADSPA_Data*) _src_sync_buffer);
+				} else {
+					descriptor->connect_port (_instances[i], SyncInputPort, (LADSPA_Data*) _src_sync_buffer);
+					descriptor->connect_port (_instances[i], SyncOutputPort, (LADSPA_Data*) _dummy_buf);
+				}
+				// zero frames, just lets the plugin act on the command
+				descriptor->run (_instances[i], 0);
+			}
+
+			// the command may have written a sync pulse for slaves at index 0
+			pending_pulse = _src_sync_buffer[0];
+		}
 
 		// stretch output by running the looper as much as we need
 		size_t avail_samps = _out_stretcher->available();
-		//nframes_t needSamples = (nframes_t) ceil(nframes * _stretch_ratio);
+		int guard = 0;
 
-		while (avail_samps < nframes) {
+		while (avail_samps < nframes && guard++ < 256) {
 			size_t sampsReq = _out_stretcher->getSamplesRequired();
 			size_t sampsUse = min(sampsReq, (size_t) nframes);
 
@@ -1469,7 +1491,7 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 			for (unsigned int i=0; i < _chan_count; ++i) {
 				// zero any input, we're not allowing input while stretching for now
 				memset(outbufs[i], 0, sampsUse * sizeof(float));			
-				// todo sync buf
+
 				if (i == 0) {
 					descriptor->connect_port (_instances[i], SyncInputPort, (LADSPA_Data*) _src_sync_buffer);
 					descriptor->connect_port (_instances[i], SyncOutputPort, (LADSPA_Data*) _src_sync_buffer);
@@ -1498,11 +1520,28 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 			avail_samps = _out_stretcher->available();
 		}
 		
-		_out_stretcher->retrieve(outbufs, nframes);			
+		size_t got = _out_stretcher->retrieve(outbufs, nframes);			
+
+		if (got < (size_t) nframes) {
+			// never leave garbage in the output
+			for (unsigned int i=0; i < _chan_count; ++i) {
+				memset (outbufs[i] + got, 0, (nframes - got) * sizeof(float));
+			}
+		}
+
+		// merge any pulse generated by the command pre-pass
+		if (pending_pulse != 0.0f) {
+			if (acc_len == 0) {
+				sync_acc[0] = pending_pulse;
+				acc_len = 1;
+			}
+			else if (pending_pulse > sync_acc[0]) {
+				sync_acc[0] = pending_pulse;
+			}
+		}
 
 		// map the sync output back into real time for the slave loops
 		resample_sync (sync_acc, acc_len, _our_syncout_buf + offset, nframes);
-		
 	}
 	else 
 	{
@@ -1555,13 +1594,8 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 	}
 
 	if (resampled) {
-		// resample out sync
-		_src_data.src_ratio = _src_out_ratio;
-		_src_data.input_frames = alt_frames;
-		_src_data.output_frames = nframes;
-		_src_data.data_in =  _src_sync_buffer;
-		_src_data.data_out = _our_syncout_buf + offset;
-		src_process (_outsync_src_state, &_src_data);
+		// map the out sync back to real time, keeping the pulses intact
+		resample_sync (_src_sync_buffer, sync_frames, _our_syncout_buf + offset, nframes);
 		_curr_dry = flush_to_zero (currdry);
 		if (dry_delta <= 0.00003f) {
 			_curr_dry = _target_dry;

@@ -398,15 +398,19 @@ Engine::buffersize_changed (nframes_t nframes)
 			(*i)->set_buffer_size(nframes);
 		}
 
-		// resize temp inbuf and sync buf
-		for (int n=0; n < 2; ++n) 
+		// resize temp inbuf and outbuf for every common channel
+		for (size_t n=0; n < _temp_input_buffers.size(); ++n) 
 		{
 			delete [] _temp_input_buffers[n];
-			delete [] _temp_output_buffers[n];
 			// create temp input buffer
 			sample_t * inbuf = new float[nframes];
 			memset(inbuf, 0, sizeof(float) * nframes);
 			_temp_input_buffers[n] = inbuf;
+		}
+
+		for (size_t n=0; n < _temp_output_buffers.size(); ++n) 
+		{
+			delete [] _temp_output_buffers[n];
 			// temp output
 			sample_t * outbuf = new float[nframes];
 			memset(outbuf, 0, sizeof(float) * nframes);
@@ -416,6 +420,20 @@ Engine::buffersize_changed (nframes_t nframes)
 		delete [] _internal_sync_buf;
 		_internal_sync_buf = new float[nframes];
 		memset(_internal_sync_buf, 0, sizeof(float) * nframes);
+
+		// The loops hold raw pointers to the sync buffer they follow, which is
+		// either our internal sync buffer or the sync-out buffer of the loop that
+		// is the sync source.  Both were just reallocated, so every loop must be
+		// pointed at the new buffer or it would read freed memory (and sync would
+		// break).  This is RT safe, it does not touch any non-rt state.
+		sample_t * sync_buf = _internal_sync_buf;
+		if ((int)_sync_source > 0 && (size_t)_sync_source <= _rt_instances.size()) {
+			sync_buf = _rt_instances[(int)_sync_source - 1]->get_sync_out_buf();
+		}
+		for (Instances::iterator i = _rt_instances.begin(); i != _rt_instances.end(); ++i)
+		{
+			(*i)->use_sync_buf (sync_buf);
+		}
 
 		_buffersize = nframes;
 	}
@@ -2249,19 +2267,25 @@ Engine::set_tempo (double tempo, bool rt)
 			nframes_t cycleframes = (nframes_t) _tempo_frames;
 			nframes_t currpos = 0;
 			if (_sync_source > 0) {
-				if (rt) {
-					cycleframes = (nframes_t) (_rt_instances[_sync_source-1]->get_control_value(Event::CycleLength) * srate);
-					currpos  = (nframes_t) (_rt_instances[_sync_source-1]->get_control_value(Event::LoopPosition) * srate);
+				// the loop reports its cycle length and position in loop time, so
+				// convert them to real time using the loop's playback speed
+				Looper * srcloop = rt ? _rt_instances[_sync_source-1] : _instances[_sync_source-1];
+				double speed = srcloop->get_playback_speed();
+				if (speed <= 0.0) {
+					speed = 1.0;
 				}
-				else {
-					cycleframes = (nframes_t) (_instances[_sync_source-1]->get_control_value(Event::CycleLength) * srate);
-					currpos  = (nframes_t) (_instances[_sync_source-1]->get_control_value(Event::LoopPosition) * srate);
-				}
+				cycleframes = (nframes_t) ((double) (srcloop->get_control_value(Event::CycleLength) * srate) / speed);
+				currpos  = (nframes_t) ((double) (srcloop->get_control_value(Event::LoopPosition) * srate) / speed);
 			}
 			else {
 				// XXX - only works for internal/midi  (doesn't really work at all)
 				cycleframes = (nframes_t) _tempo_frames; // XXX - only right when quantize is cycle!
 				currpos = (nframes_t) _quarter_counter;
+			}
+
+			if (cycleframes == 0) {
+				// avoid a division by zero
+				cycleframes = 1;
 			}
 
 			nframes_t target_frame = ((tinfo.framepos / frames_per_bar) * frames_per_bar) + (currpos % cycleframes);
@@ -2613,9 +2637,19 @@ Engine::generate_sync (nframes_t offset, nframes_t nframes)
 			_internal_sync_buf[n]  = 1.0;
 		}
 
-		if (_rt_instances[_sync_source-1]->get_control_value(Event::State) != LooperStateRecording) {
-			// calc new tempo
-			nframes_t cycleframes = (nframes_t) (_rt_instances[_sync_source-1]->get_control_value(Event::CycleLength) * _driver->get_samplerate());
+		Looper * srcloop = _rt_instances[_sync_source-1];
+
+		// The loop reports its cycle length, position and length in loop time.
+		// If it is playing at a different speed (rate or time stretch) then
+		// loop time and real time differ by this factor.
+		double speed = srcloop->get_playback_speed();
+		if (speed <= 0.0) {
+			speed = 1.0;
+		}
+
+		if (srcloop->get_control_value(Event::State) != LooperStateRecording) {
+			// calc new tempo, from the real time length of a cycle
+			nframes_t cycleframes = (nframes_t) ((double) (srcloop->get_control_value(Event::CycleLength) * _driver->get_samplerate()) / speed);
 			double ntempo = 0.0;
 			if (cycleframes > 0) {
 				ntempo = (_driver->get_samplerate() * 30.0 * _eighth_cycle / cycleframes);
@@ -2639,17 +2673,24 @@ Engine::generate_sync (nframes_t offset, nframes_t nframes)
 			
 			// just calculate quarter note beats for update
 			if (_quarter_note_frames > 0.0) {
-				nframes_t currpos  = (nframes_t) (_rt_instances[_sync_source-1]->get_control_value(Event::LoopPosition) * _driver->get_samplerate());
-				nframes_t loopframes = (nframes_t) (_rt_instances[_sync_source-1]->get_control_value(Event::LoopLength) * _driver->get_samplerate());
-				int inst_stt = (int)(_rt_instances[_sync_source-1]->get_control_value(Event::State));
+				nframes_t currpos  = (nframes_t) (srcloop->get_control_value(Event::LoopPosition) * _driver->get_samplerate());
+				nframes_t loopframes = (nframes_t) (srcloop->get_control_value(Event::LoopLength) * _driver->get_samplerate());
+				int inst_stt = (int)(srcloop->get_control_value(Event::State));
 				bool inst_paused = (inst_stt == LooperStateOff || inst_stt == LooperStatePaused || inst_stt == LooperStateOffMuted);
 				if ((loopframes > 0) && !inst_paused) {
-					nframes_t testval = (((currpos + nframes) % loopframes) % (nframes_t)_quarter_note_frames);
-					
-					if (testval <= nframes || testval == 0) {
-						// inaccurate
-						//cerr << "quarter hit" << endl;
-						hit_at = (int) 0;
+					// position and length are in loop time, so bring the quarter
+					// note length and the cycle duration into loop time as well
+					nframes_t qframes = (nframes_t) (_quarter_note_frames * speed);
+					nframes_t spanframes = (nframes_t) (nframes * speed);
+
+					if (qframes > 0) {
+						nframes_t testval = (((currpos + spanframes) % loopframes) % qframes);
+						
+						if (testval <= spanframes || testval == 0) {
+							// inaccurate
+							//cerr << "quarter hit" << endl;
+							hit_at = (int) 0;
+						}
 					}
 				}
 			}

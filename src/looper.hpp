@@ -83,6 +83,19 @@ class Looper
 
 	unsigned int get_index() const { return _index; }
 	unsigned int get_channel_count() const { return _chan_count; }
+
+	// number of loop-time samples that are consumed per real-time sample
+	// (1.0 means normal speed).  This reflects the rate (resampling) or the
+	// time stretch ratio, whichever is currently in effect in run_loops().
+	double get_playback_speed () const {
+		if (ports[Rate] != 1.0f) {
+			return _src_in_ratio;
+		}
+		if (_stretch_ratio != 1.0 && _stretch_ratio > 0.0) {
+			return 1.0 / _stretch_ratio;
+		}
+		return 1.0;
+	}
 	
 	void set_use_common_ins (bool val);
 	bool get_use_common_ins () const { return _use_common_ins; }
