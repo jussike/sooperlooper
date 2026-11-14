@@ -150,12 +150,6 @@ class Looper
 	// takes back the lead the loop has over the audible stretcher output
 	void settle_stretch_position ();
 
-	// time map of the material held by the stretcher
-	void   stretch_map_clear ();
-	void   stretch_map_push (double loopframes, double realframes);
-	double stretch_map_pop (double realframes, double fallback_inv);
-	double stretch_map_pending () const;
-
 	static void compute_peak (sample_t *buf, nframes_t nsamples, float& peak) {
 		float p = peak;
 		
@@ -277,23 +271,12 @@ class Looper
 	bool                  _stretch_active;     // stretch path was used by the previous call
 	bool                  _sync_fifo_reset;    // stretchers were reset, restart the delay line
 
-	// Time map of the stretch path, used to find out how far the loop
-	// position is ahead of the audible (delayed) output.  Every chunk fed to
-	// the stretcher is stored with its loop time length and the real time
-	// length it produces at the ratio in effect when it was fed.  Output taken
-	// from the stretcher consumes real time from the oldest segments, so the
-	// loop time still held is exact even when the ratio changes while
-	// stretching.  When the stretcher is bypassed the loop position is moved
-	// back by that amount so the audible loop stays continuous and in sync.
-	enum { StretchSegCount = 1024 };
-	struct StretchSeg {
-		double loop;
-		double real;
-	};
-	StretchSeg            _stretch_segs[StretchSegCount];
-	unsigned int          _stretch_seg_head;   // oldest segment
-	unsigned int          _stretch_seg_count;
-	double                _stretch_lat_corr;   // loop time correction for latency changes
+	// Output alignment of the stretcher.  The stretcher output is aligned to
+	// its input (start pad + dropped start delay), so the audible loop follows
+	// the stretched time line in _sync_fifo_rpos.  This is the number of
+	// output samples still to drop (> 0) or to emit as silence (< 0) to keep
+	// that alignment when the stretcher delay changes.
+	long                  _stretch_out_adj;
 
 	bool _ok;
 	volatile bool request_pending;

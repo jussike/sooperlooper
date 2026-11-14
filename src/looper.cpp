@@ -63,6 +63,37 @@ static const double MinResamplingRate = 0.25f;
 static const double MaxResamplingRate = 8.0f;
 static const int SrcAudioQuality = SRC_LINEAR;
 
+#if defined(RUBBERBAND_API_MAJOR_VERSION) && defined(RUBBERBAND_API_MINOR_VERSION) && \
+	(RUBBERBAND_API_MAJOR_VERSION > 2 || (RUBBERBAND_API_MAJOR_VERSION == 2 && RUBBERBAND_API_MINOR_VERSION >= 7))
+#define SL_RUBBERBAND_HAS_START_PAD 1
+#endif
+
+/*
+ * RubberBand 3.0 and later do not pad the start in real time mode.  To get
+ * the output aligned with the input the caller has to feed
+ * getPreferredStartPad() samples of silence first and then drop
+ * getStartDelay() samples of output.  Older versions pad internally and the
+ * output is simply delayed by getLatency().
+ */
+static size_t stretcher_start_pad (RubberBandStretcher * s)
+{
+#ifdef SL_RUBBERBAND_HAS_START_PAD
+	return s->getPreferredStartPad();
+#else
+	(void) s;
+	return 0;
+#endif
+}
+
+static size_t stretcher_start_delay (RubberBandStretcher * s)
+{
+#ifdef SL_RUBBERBAND_HAS_START_PAD
+	return s->getStartDelay();
+#else
+	return s->getLatency();
+#endif
+}
+
 
 /*
  * Time-maps a sync buffer from inframes samples to outframes samples while
@@ -261,9 +292,7 @@ Looper::initialize (unsigned int index, unsigned int chan_count, float loopsecs,
 	_sync_pending_pulse = 0.0f;
 	_stretch_active = false;
 	_sync_fifo_reset = false;
-	_stretch_seg_head = 0;
-	_stretch_seg_count = 0;
-	_stretch_lat_corr = 0.0;
+	_stretch_out_adj = 0;
 	_tempo_stretch = false;
 	_pending_stretch = false;
 	_pending_stretch_ratio = 0.0;
@@ -747,6 +776,13 @@ Looper::set_buffer_size (nframes_t bufsize)
 		}
 		_stretch_buffer = new float[_src_buffer_len * _chan_count];
 
+		if (_stretch_active) {
+			// the stretch path restarts with the new buffers, put the loop
+			// back on its time line first
+			settle_stretch_position ();
+			_stretch_active = false;
+		}
+
 		// delay line for the sync output of the stretch/pitch path
 		if (_sync_fifo) {
 			delete [] _sync_fifo;
@@ -824,19 +860,11 @@ Looper::recompute_latencies()
 		ports[OutputLatency] = 0;
 	}
 
-	// add any latency due to timestretch
-	if (_stretch_ratio != 1.0) {
-		//ports[OutputLatency] += _out_stretcher->getLatency();
-		// the plugin adds this to loop positions, so it has to be in loop
-		// time: the loop advances 1/ratio samples per real time sample
-		double lat = (double) _out_stretcher->getLatency();
-		ports[SyncOffsetSamples] = (float) ((_stretch_ratio > 0.0) ? (lat / _stretch_ratio) : lat);
-	}
-	else {
-		// Not stretching (anymore): the stretcher latency no longer applies.
-		// Without this reset the old latency stays in the port after the
-		// stretch ratio returns to 1.0 and keeps shifting the loop positions
-		// the plugin computes for trigger/oneshot/playback sync.
+	// While the stretch path is active run_loops() keeps SyncOffsetSamples
+	// at the measured lead of the loop over its audible output.  Otherwise
+	// there is no offset; without this reset an old value would keep
+	// shifting the positions the plugin computes for trigger/oneshot/sync.
+	if (!_stretch_active) {
 		ports[SyncOffsetSamples] = 0.0f;
 	}
 		
@@ -854,82 +882,14 @@ Looper::shift_loop_positions (double loopframes)
 }
 
 void
-Looper::stretch_map_clear ()
-{
-	_stretch_seg_head = 0;
-	_stretch_seg_count = 0;
-}
-
-void
-Looper::stretch_map_push (double loopframes, double realframes)
-{
-	if (realframes <= 0.0) {
-		return;
-	}
-
-	if (_stretch_seg_count == (unsigned int) StretchSegCount) {
-		// full, merge into the newest segment (slightly less exact)
-		unsigned int idx = (_stretch_seg_head + _stretch_seg_count - 1) % StretchSegCount;
-		_stretch_segs[idx].loop += loopframes;
-		_stretch_segs[idx].real += realframes;
-		return;
-	}
-
-	unsigned int idx = (_stretch_seg_head + _stretch_seg_count) % StretchSegCount;
-	_stretch_segs[idx].loop = loopframes;
-	_stretch_segs[idx].real = realframes;
-	++_stretch_seg_count;
-}
-
-double
-Looper::stretch_map_pop (double realframes, double fallback_inv)
-{
-	double loopframes = 0.0;
-
-	while (realframes > 0.0 && _stretch_seg_count > 0) {
-		StretchSeg & seg = _stretch_segs[_stretch_seg_head];
-
-		if (seg.real <= realframes) {
-			loopframes += seg.loop;
-			realframes -= seg.real;
-			_stretch_seg_head = (_stretch_seg_head + 1) % StretchSegCount;
-			--_stretch_seg_count;
-		}
-		else {
-			double part = seg.loop * (realframes / seg.real);
-			loopframes += part;
-			seg.loop -= part;
-			seg.real -= realframes;
-			realframes = 0.0;
-		}
-	}
-
-	if (realframes > 0.0) {
-		// the stretcher gave more than we accounted for, use the current ratio
-		loopframes += realframes * fallback_inv;
-	}
-
-	return loopframes;
-}
-
-double
-Looper::stretch_map_pending () const
-{
-	double sum = 0.0;
-	for (unsigned int n = 0; n < _stretch_seg_count; ++n) {
-		sum += _stretch_segs[(_stretch_seg_head + n) % StretchSegCount].loop;
-	}
-	return sum;
-}
-
-void
 Looper::settle_stretch_position ()
 {
-	// The loop position is ahead of the audible (delayed) stretcher output by
-	// the loop time still held by the stretcher (including the start delay we
-	// ran ahead by).  Take it back so the audible loop simply continues where
-	// the last emitted sample was.
-	double lag = stretch_map_pending () + _stretch_lat_corr;
+	// The loop has been run (_sync_fifo_wpos loop time samples) further than
+	// the stretched time line has advanced (_sync_fifo_rpos, which grows by
+	// 1/ratio per real time sample and is what the slaves followed).  Take
+	// that lead back so the loop continues exactly on the time line, no
+	// matter how the stretcher handled ratio changes internally.
+	double lag = (double) _sync_fifo_wpos - _sync_fifo_rpos;
 
 	if (lag > 192000.0) {
 		lag = 192000.0;
@@ -942,8 +902,7 @@ Looper::settle_stretch_position ()
 		shift_loop_positions (-lag);
 	}
 
-	stretch_map_clear ();
-	_stretch_lat_corr = 0.0;
+	_sync_fifo_rpos = (double) _sync_fifo_wpos;
 }
 
 bool Looper::has_loop() const
@@ -1445,6 +1404,7 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 			// undelayed, so take that lead back.  This keeps the audible loop
 			// continuous and in time with the slaves.
 			settle_stretch_position ();
+			ports[SyncOffsetSamples] = 0.0f;
 		}
 
 		// the stretcher is idle, it must be restarted when it is needed again
@@ -1658,39 +1618,46 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 				// of the previous run first
 				settle_stretch_position ();
 			}
-			else {
-				// drop anything the stretcher still holds from earlier use
-				_out_stretcher->reset();
-			}
+
+			// start from a clean stretcher
+			_out_stretcher->reset();
+
 			_sync_fifo_wpos = 0;
 			_sync_fifo_ke = 0;
-			_sync_last_lat = _out_stretcher->getLatency();
-			const double startlat = (double) _sync_last_lat * inv;
-			// the audio comes out latency samples late, so does the sync
-			_sync_fifo_rpos = - startlat;
+			_sync_fifo_rpos = 0.0;
 			_sync_pending_pulse = 0.0f;
-			stretch_map_clear ();
-			_stretch_lat_corr = 0.0;
 			_stretch_active = true;
 			_sync_fifo_reset = false;
 
-			// The stretcher output lags what we feed it by its latency.  Run
-			// the loop that far ahead so the delayed audio (and the delayed
-			// sync pulses) end up on the original time line instead of being
-			// late against the slaves.  The start delay is the first segment
-			// of the time map, at the ratio in effect now.
-			if (startlat > 0.0) {
-				stretch_map_push (startlat, (double) _sync_last_lat);
-				shift_loop_positions (startlat);
+			// Align the stretcher output with its input, as the RubberBand
+			// documentation asks for in real time mode: feed the preferred
+			// amount of silence first and drop the start delay from the
+			// output.  The audible loop then continues exactly where it was
+			// and follows the stretched time line in _sync_fifo_rpos.
+			_sync_last_lat = stretcher_start_delay (_out_stretcher);
+			_stretch_out_adj = (long) _sync_last_lat;
+
+			size_t pad = stretcher_start_pad (_out_stretcher);
+			if (pad > 0) {
+				float * zbufs[_chan_count];
+				for (unsigned int i=0; i < _chan_count; ++i) {
+					zbufs[i] = _stretch_buffer + (size_t) i * _src_buffer_len;
+					memset (zbufs[i], 0, _src_buffer_len * sizeof(float));
+				}
+				while (pad > 0) {
+					size_t chunk = min (pad, (size_t) _buffersize);
+					_out_stretcher->process (zbufs, chunk, false);
+					pad -= chunk;
+				}
 			}
 		}
 
 		{
-			size_t lat = _out_stretcher->getLatency();
+			size_t lat = stretcher_start_delay (_out_stretcher);
 			if (lat != _sync_last_lat) {
-				double d = ((double) lat - (double) _sync_last_lat) * inv;
-				_sync_fifo_rpos -= d;
-				_stretch_lat_corr += d;
+				// the stretcher delay changed (pitch change): keep the output
+				// on the time line by dropping or adding output samples
+				_stretch_out_adj += (long) lat - (long) _sync_last_lat;
 				_sync_last_lat = lat;
 			}
 		}
@@ -1724,11 +1691,21 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 			}
 		}
 
+		// output samples of this block to emit as silence (delay got shorter)
+		size_t silence = 0;
+		if (_stretch_out_adj < 0) {
+			silence = min ((size_t) (-_stretch_out_adj), (size_t) nframes);
+		}
+
+		// output needed: the rest of this block plus whatever must be dropped
+		size_t want = ((size_t) nframes - silence)
+			+ ((_stretch_out_adj > 0) ? (size_t) _stretch_out_adj : 0);
+
 		// stretch output by running the looper as much as we need
 		size_t avail_samps = _out_stretcher->available();
 		int guard = 0;
 
-		while (avail_samps < nframes && guard++ < 256) {
+		while (avail_samps < want && guard++ < 1024) {
 			size_t sampsReq = _out_stretcher->getSamplesRequired();
 			size_t sampsUse = min(sampsReq, (size_t) nframes);
 
@@ -1785,10 +1762,6 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 				_sync_fifo_wpos += sampsUse;
 			}
 			consumed += (nframes_t) sampsUse;
-			if (sampsUse > 0) {
-				// remember what this chunk becomes in real time at this ratio
-				stretch_map_push ((double) sampsUse, (double) sampsUse * ratio);
-			}
 
 			// stretch
 			_out_stretcher->process(outbufs, sampsUse, false);
@@ -1796,11 +1769,38 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 			avail_samps = _out_stretcher->available();
 		}
 		
-		size_t got = _out_stretcher->retrieve(outbufs, nframes);			
+		// drop the output that lies before the aligned start of the stream
+		if (_stretch_out_adj > 0) {
+			float * scratch[_chan_count];
+			for (unsigned int i=0; i < _chan_count; ++i) {
+				scratch[i] = _stretch_buffer + (size_t) i * _src_buffer_len;
+			}
+			while (_stretch_out_adj > 0) {
+				size_t chunk = min ((size_t) _stretch_out_adj, (size_t) _src_buffer_len);
+				size_t dropped = _out_stretcher->retrieve (scratch, chunk);
+				if (dropped == 0) {
+					break;
+				}
+				_stretch_out_adj -= (long) dropped;
+			}
+		}
 
-		// the loop time equivalent of what we actually took out of the
-		// stretcher, using the ratio each part was fed with
-		const double popped = stretch_map_pop ((double) got, inv);
+		// a shorter stretcher delay is made up with silence
+		if (silence > 0) {
+			for (unsigned int i=0; i < _chan_count; ++i) {
+				memset (outbufs[i], 0, silence * sizeof(float));
+			}
+			_stretch_out_adj += (long) silence;
+		}
+
+		size_t got = silence;
+		{
+			float * retbufs[_chan_count];
+			for (unsigned int i=0; i < _chan_count; ++i) {
+				retbufs[i] = outbufs[i] + silence;
+			}
+			got += _out_stretcher->retrieve (retbufs, nframes - silence);
+		}
 
 		if (got < (size_t) nframes) {
 			// never leave garbage in the output
@@ -1824,12 +1824,10 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 				ke = wpos - _sync_fifo_size / 2;
 			}
 
-			// loop time per real time sample for the audio emitted this block
-			const double block_inv = (got > 0) ? (popped / (double) got) : 0.0;
-
+			// the read position follows the stretched time line exactly:
+			// 1/ratio loop time samples per real time sample
 			for (nframes_t j = 0; j < nframes; ++j) {
-				size_t steps = ((size_t) j + 1 < got) ? ((size_t) j + 1) : got;
-				double posend = rpos + (double) steps * block_inv;
+				double posend = rpos + (double) (j + 1) * inv;
 				long long hi = (long long) floor (posend);
 				float v = 0.0f;
 
@@ -1857,7 +1855,14 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 			}
 
 			_sync_fifo_ke = ke;
-			_sync_fifo_rpos = rpos + popped;
+			_sync_fifo_rpos = rpos + (double) nframes * inv;
+		}
+
+		// The plugin adds this to positions it jumps to (trigger, oneshot,
+		// playback sync) because what it plays now is heard this much later.
+		{
+			double lead = (double) _sync_fifo_wpos - _sync_fifo_rpos;
+			ports[SyncOffsetSamples] = (float) max (0.0, lead);
 		}
 	}
 	else 
