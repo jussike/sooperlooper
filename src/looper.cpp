@@ -860,13 +860,11 @@ Looper::recompute_latencies()
 		ports[OutputLatency] = 0;
 	}
 
-	// While the stretch path is active run_loops() keeps SyncOffsetSamples
-	// at the measured lead of the loop over its audible output.  Otherwise
-	// there is no offset; without this reset an old value would keep
-	// shifting the positions the plugin computes for trigger/oneshot/sync.
-	if (!_stretch_active) {
-		ports[SyncOffsetSamples] = 0.0f;
-	}
+	// No sync offset is needed: in the stretch path the sync pulses are
+	// delayed together with the audio (see _sync_fifo), so a position the
+	// plugin jumps to is heard at the same moment its pulse leaves.  Adding
+	// the stretcher lead here would make the loop run ahead of its pulses.
+	ports[SyncOffsetSamples] = 0.0f;
 		
 
 	//cerr << "input lat: " << ports[InputLatency] << endl;
@@ -1395,6 +1393,18 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 	bool  pitched = _pitch_shift != 0.0;
 	bool  use_stretch = !resampled && (stretched || pitched);
 
+	// The sync input of this block.  The loop that is the sync source follows
+	// its own sync output buffer, which still holds the pulses of the previous
+	// cycle at this point.  The normal path is fine with that (the plugin
+	// clears it in place before reading it), but the resampled and stretched
+	// paths read it separately and would act on their own stale pulses
+	// (e.g. a playback sync jump on every loop pass).
+	sample_t * sync_in_real = _use_sync_buf + offset;
+	if (_use_sync_buf == _our_syncout_buf) {
+		memset (_our_syncin_buf + offset, 0, nframes * sizeof(float));
+		sync_in_real = _our_syncin_buf + offset;
+	}
+
 	if (!use_stretch) {
 		if (_stretch_active) {
 			// We are leaving the stretch path.  While it was active the loop
@@ -1526,7 +1536,7 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 				// This must not use an interpolating resampler: that smears
 				// or drops the single sample sync pulses.
 				sync_frames = alt_frames;
-				resample_sync (_use_sync_buf + offset, nframes, _src_sync_buffer, sync_frames);
+				resample_sync (sync_in_real, nframes, _src_sync_buffer, sync_frames);
 			}
 			else if (alt_frames > sync_frames) {
 				// should not happen, but never feed the plugin stale sync data
@@ -1607,7 +1617,6 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 		 *     audible output of this loop and do not depend on how the
 		 *     stretcher chunks its input requests.
 		 */
-		sample_t * sync_in_real = _use_sync_buf + offset;
 		nframes_t  consumed     = 0;                // loop time frames consumed so far
 		const double ratio      = (_stretch_ratio > 0.0) ? _stretch_ratio : 1.0;
 		const double inv        = 1.0 / ratio;      // loop time per real time
@@ -1858,12 +1867,9 @@ Looper::run_loops (nframes_t offset, nframes_t nframes)
 			_sync_fifo_rpos = rpos + (double) nframes * inv;
 		}
 
-		// The plugin adds this to positions it jumps to (trigger, oneshot,
-		// playback sync) because what it plays now is heard this much later.
-		{
-			double lead = (double) _sync_fifo_wpos - _sync_fifo_rpos;
-			ports[SyncOffsetSamples] = (float) max (0.0, lead);
-		}
+		// The sync pulses travel through _sync_fifo together with the audio,
+		// so positions the plugin jumps to need no extra offset.
+		ports[SyncOffsetSamples] = 0.0f;
 	}
 	else 
 	{
